@@ -1,0 +1,193 @@
+/*  ESP32‑S3‑DevKitC‑1  ·  10‑Touch + DFPlayer‑A/B 淡入淡出
+ *  ───────────────────────────────────────────────────────────
+ *  BG  (DF‑A) 循环播放  /mp3/0001.mp3
+ *  N 根触摸           → DF‑B 播放 /mp3/000(N+1).mp3
+ *  方向自适应触摸判定，15 s 无触摸时自动 baseline 漂移
+ *  串口日志：触摸数组 + 正在播放的文件名
+ *  DFPlayer‑A  TX→16  RX←15   (串 1 kΩ)
+ *  DFPlayer‑B  TX→44  RX←43   (串 1 kΩ)
+ */
+
+/* ——— 依赖 ——— */
+#include <Arduino.h>
+#include <DFRobotDFPlayerMini.h>
+#include <esp32-hal-touch.h>
+#include <math.h>  // fabsf
+
+/* ——— 触摸配置 ——— */
+const uint8_t TPIN[] = { 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
+const uint8_t N_CH = sizeof(TPIN);
+const float DELTA_TOUCH = 0.05f;  // ≥5 % 变化即触摸
+const uint32_t SCAN_MS = 50;
+const uint32_t NO_TOUCH_MS = 15000;  // 15 s 无触摸 → 漂移
+uint16_t base[N_CH];
+uint32_t lastTouchMs = 0;
+
+/* ——— DFPlayer 配置 ——— */
+HardwareSerial mp3A(2);  // UART2
+HardwareSerial mp3B(1);  // UART1
+DFRobotDFPlayerMini dfA, dfB;
+
+const uint8_t BACK_TRACK = 1;  // 0001.mp3
+const uint8_t BASE_FILE = 2;   // 触摸 1 根 -> 0002.mp3
+
+/* ——— 淡化参数 ——— */
+const uint8_t VOL_MAX = 25, VOL_MIN = 0, STEP_DB = 1;
+const uint16_t STEP_MS = 60;
+
+enum FState { IDLE,
+              OUT_A,
+              IN_B,
+              WAIT_B,
+              OUT_B,
+              IN_A };
+FState state = IDLE;
+uint32_t fadeTick = 0;
+uint8_t curCount = 0;
+
+/* ——— 打印当前曲目 ——— */
+void logTrack(const char *tag, uint16_t num) {
+  char name[10];  // "0000.mp3"
+  sprintf(name, "%04u.mp3", num);
+  Serial.printf("%s ▶ %s\n", tag, name);
+}
+
+/* ——— 校准基线 ——— */
+void calibrate() {
+  for (uint8_t i = 0; i < N_CH; ++i) {
+    uint32_t s = 0;
+    for (uint8_t n = 0; n < 8; ++n) {
+      s += touchRead(TPIN[i]);
+      delay(6);
+    }
+    base[i] = s / 8;
+  }
+  lastTouchMs = millis();
+}
+
+/* ——— 计数触摸 ——— */
+uint8_t countTouch(bool &any) {
+  uint8_t c = 0;
+  any = false;
+  for (uint8_t i = 0; i < N_CH; ++i) {
+    float diff = fabsf((float)touchRead(TPIN[i]) - base[i]) / base[i];
+    if (diff >= DELTA_TOUCH) {
+      ++c;
+      any = true;
+    }
+  }
+  return c;
+}
+
+/* ——— 音量步进 ——— */
+inline void fadeVol(DFRobotDFPlayerMini &d, int dir) {
+  int v = d.readVolume();
+  if (dir > 0 && v < VOL_MAX) d.volume(v + STEP_DB);
+  if (dir < 0 && v > VOL_MIN) d.volume(v - STEP_DB);
+}
+
+/* ——— SETUP ——— */
+void setup() {
+  Serial.begin(115200);
+
+  mp3A.begin(9600);  // DF‑A  RX=16  TX=15
+  mp3B.begin(9600);  // DF‑B  RX=44  TX=43
+
+  if (!dfA.begin(mp3A, false, false) || !dfB.begin(mp3B, false, false)) {
+    while (true) {
+      Serial.println("DF init fail");
+      delay(1000);
+    }
+  }
+  dfA.volume(VOL_MAX);
+  dfB.volume(VOL_MIN);
+  dfA.loop(BACK_TRACK);
+  logTrack("BG", BACK_TRACK);
+
+  calibrate();
+}
+
+/* ——— LOOP ——— */
+void loop() {
+  /* 1. 触摸扫描 */
+  static uint32_t scanT = 0;
+  if (millis() - scanT >= SCAN_MS) {
+    scanT = millis();
+    bool anyTouch = false;
+    uint8_t cnt = countTouch(anyTouch);
+
+    /* 调试数组输出 */
+    Serial.print("[");
+    for (uint8_t i = 0; i < N_CH; ++i) {
+      float diff = fabsf((float)touchRead(TPIN[i]) - base[i]) / base[i];
+      Serial.print(diff >= DELTA_TOUCH ? 1 : 0);
+      if (i < N_CH - 1) Serial.print(',');
+    }
+    Serial.printf("]  Count=%u\n", cnt);
+
+    /* 数量变化 → 切前景 */
+    if (cnt > 0 && cnt != curCount) {
+      curCount = cnt;
+      state = OUT_A;
+      lastTouchMs = millis();
+    }
+    /* 无触摸且处于前景 / 等待 → 回背景 */
+    if (cnt == 0 && curCount != 0 && (state == WAIT_B || state == IDLE)) {
+      state = OUT_B;
+    }
+    /* 漂移 */
+    if (!anyTouch && millis() - lastTouchMs > NO_TOUCH_MS) {
+      for (uint8_t i = 0; i < N_CH; ++i) {
+        uint16_t raw = touchRead(TPIN[i]);
+        base[i] = (base[i] * 7 + raw) >> 3;  // EMA α=1/8
+      }
+      lastTouchMs = millis();
+      Serial.println("Baseline Calibrated (auto drift)");
+    }
+  }
+
+  /* 2. 淡化状态机 */
+  if (millis() - fadeTick >= STEP_MS) {
+    fadeTick = millis();
+    switch (state) {
+      case OUT_A:
+        fadeVol(dfA, -1);
+        if (dfA.readVolume() == VOL_MIN) {
+          uint16_t fileNo = BASE_FILE + curCount - 1;
+          dfB.playMp3Folder(fileNo);
+          logTrack("FX", fileNo);
+          state = IN_B;
+        }
+        break;
+
+      case IN_B:
+        fadeVol(dfB, +1);
+        if (dfB.readVolume() == VOL_MAX) state = WAIT_B;
+        break;
+
+      case WAIT_B:
+        if (dfB.readState() == 0) state = OUT_B;
+        break;
+
+      case OUT_B:
+        fadeVol(dfB, -1);
+        if (dfB.readVolume() == VOL_MIN) {
+          dfA.volume(VOL_MIN);
+          dfA.loop(BACK_TRACK);
+          logTrack("BG", BACK_TRACK);
+          state = IN_A;
+        }
+        break;
+
+      case IN_A:
+        fadeVol(dfA, +1);
+        if (dfA.readVolume() == VOL_MAX) {
+          state = IDLE;
+          curCount = 0;
+        }
+        break;
+
+      default: break;
+    }
+  }
+}
