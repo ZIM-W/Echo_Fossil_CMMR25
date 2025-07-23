@@ -1,8 +1,12 @@
-/*  ESP32‑S3 DevKitC‑1 · 10‑Touch + DF‑A/DF‑B
- *  ─────────────────────────────────────────────
- *  DF‑A  背景 0001.mp3 一直循环（VOL_FULL）
- *  DF‑B  同时触摸 N 根 → 播放 000N.mp3 (VOL_FULL)
- *        触摸数变就立即 stop+play；松手 stop+mute
+/*  ESP32‑S3 DevKitC‑1  ·  10‑Touch + DF‑A/DF‑B
+ *  -----------------------------------------------------------
+ *  DF‑A  背景 0001.mp3 100 % 循环
+ *  DF‑B  同时触摸 N 根   → 播 000N.mp3 100 %  (N=1‑10)
+ *        N 改变则立刻切曲；N=0 时立刻停播并静音
+ *  Touch GPIO: 4‑13   ·  自适应方向  ·  15 s 自动漂移
+ *  串口: 115200  打印触摸数组 + 当前 BG / FG 文件
+ *  UART: DF‑A  RX=39  TX=38   ·  DF‑B  RX=41  TX=40
+ *        两条 RX → DFPlayer RX 需串 1 kΩ
  */
 
 #include <Arduino.h>
@@ -10,37 +14,40 @@
 #include <esp32-hal-touch.h>
 #include <math.h>
 
-/* —— 配置 —— */
-const uint8_t TOUCH_PINS[] = { 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
+/* ——— 用户参数 ——— */
+const uint8_t TOUCH_PINS[] = { 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
 const uint8_t N_CH = sizeof(TOUCH_PINS);
-const float DELTA_TOUCH = 0.05f;  // ≥5 % 变化算触摸
+const float DELTA_TOUCH = 0.05f;  // ≥5 % 变化算触摸
 const uint32_t SCAN_MS = 50;
 const uint32_t DRIFT_MS = 15000;  // 无触摸漂移
 const uint8_t VOL_FULL = 25;
 const uint8_t VOL_MUTE = 0;
 
-/* —— 硬件串口 —— */
-HardwareSerial mp3A(2);  // UART2  38 / 39
-HardwareSerial mp3B(1);  // UART1  40 / 41
+/* ——— 硬件串口 & DFPlayer ——— */
+HardwareSerial mp3A(2);  // UART2  (RX=39 TX=38)
+HardwareSerial mp3B(1);  // UART1  (RX=41 TX=40)
 DFRobotDFPlayerMini dfA, dfB;
 
-/* —— 全局状态 —— */
+/* ——— 全局状态 ——— */
 uint16_t base[N_CH];
-uint8_t curCount = 0;
+uint8_t curCount = 0;  // 当前触摸数量
 uint32_t lastTouchMs = 0;
+
+int dfAstate = 0;
+int dfBstate = 0;
 
 /* ---------- 打印曲目 ---------- */
 void logTrack(const char* tag, uint16_t n) {
-  char f[10];
-  sprintf(f, "%04u.mp3", n);
-  Serial.printf("%s -> %s\n", tag, f);
+  char buf[10];
+  sprintf(buf, "%04u.mp3", n);
+  Serial.printf("%s -> %s\n", tag, buf);
 }
 
 /* ---------- 校准 ---------- */
 void calibrate() {
-  for (uint8_t i = 0; i < N_CH; i++) {
+  for (uint8_t i = 0; i < N_CH; ++i) {
     uint32_t s = 0;
-    for (uint8_t n = 0; n < 8; n++) {
+    for (uint8_t n = 0; n < 8; ++n) {
       s += touchRead(TOUCH_PINS[i]);
       delay(6);
     }
@@ -53,9 +60,9 @@ void calibrate() {
 uint8_t countTouch(bool& any) {
   uint8_t c = 0;
   any = false;
-  for (uint8_t i = 0; i < N_CH; i++) {
-    float d = fabsf((float)touchRead(TOUCH_PINS[i]) - base[i]) / base[i];
-    if (d >= DELTA_TOUCH) {
+  for (uint8_t i = 0; i < N_CH; ++i) {
+    float diff = fabsf((float)touchRead(TOUCH_PINS[i]) - base[i]) / base[i];
+    if (diff >= DELTA_TOUCH) {
       ++c;
       any = true;
     }
@@ -63,14 +70,12 @@ uint8_t countTouch(bool& any) {
   return c;
 }
 
-/* ---------- SETUP ---------- */
+/* ---------- Arduino SETUP ---------- */
 void setup() {
-  calibrate();
-
   Serial.begin(115200);
 
-  mp3A.begin(9600, SERIAL_8N1, 39, 38);  // RX,TX
-  mp3B.begin(9600, SERIAL_8N1, 41, 40);  // RX,TX
+  mp3A.begin(9600, SERIAL_8N1, 39, 38);  // DF‑A
+  mp3B.begin(9600, SERIAL_8N1, 41, 40);  // DF‑B
 
   if (!dfA.begin(mp3A, false, false) || !dfB.begin(mp3B, false, false)) {
     while (1) {
@@ -79,18 +84,25 @@ void setup() {
     }
   }
 
-  dfA.volume(VOL_FULL);
-  dfA.enableLoop();
   dfA.stop();
+  dfB.stop();
+
+  dfA.enableLoop();
+  dfB.enableLoop();
+  dfA.enableDAC();
+  dfB.enableDAC();
+  delay(100);
+
+  dfA.volume(VOL_FULL);
   dfA.loop(1);  // 背景 0001.mp3
   logTrack("BG", 1);
-
   dfB.volume(VOL_MUTE);  // 默认静音
-  dfB.enableLoop();
-  dfB.stop();
+
+  calibrate();
+  delay(100);
 }
 
-/* ---------- LOOP ---------- */
+/* ---------- Arduino LOOP ---------- */
 void loop() {
   static uint32_t scanT = 0;
   if (millis() - scanT >= SCAN_MS) {
@@ -98,34 +110,47 @@ void loop() {
     bool any = false;
     uint8_t cnt = countTouch(any);
 
-    /* 串口打印触摸数组 */
+    /* 串口显示触摸数组 */
     Serial.print("[");
-    for (uint8_t i = 0; i < N_CH; i++) {
+    for (uint8_t i = 0; i < N_CH; ++i) {
       float d = fabsf((float)touchRead(TOUCH_PINS[i]) - base[i]) / base[i];
       Serial.print(d >= DELTA_TOUCH ? '1' : '0');
       if (i < N_CH - 1) Serial.print(',');
     }
     Serial.printf("] Count=%u\n", cnt);
 
-    /* —— 前景控制逻辑 —— */
-    if (cnt == 0 && curCount != 0) {  // 松手 → 停 DF‑B
+    /* 背景看门狗：DF‑A 不在播放 → 重新 loop */
+    if (dfA.available()) { dfAstate = dfA.readState(); }
+    if (dfB.available()) { dfBstate = dfB.readState(); }
+    if (dfAstate == 0) {
+      dfA.loop(1);
+      logTrack("BG", 1);
+      dfAstate = 1;
+    }
+    if (dfBstate == 0) {
+      dfB.play(curCount + 1);
+      logTrack("FG", curCount + 1);
+      dfBstate = 1;
+    }
+    /* —— 前景 DF‑B 控制 —— */
+    if (cnt == 0) {  // 松手 → 停播
       dfB.stop();
       dfB.volume(VOL_MUTE);
       curCount = 0;
       Serial.println("FG stop (no touch)");
-    } else if (cnt > 0 && cnt != curCount) {  // 数量变化 → 切曲
+    } else if (cnt > 0 && cnt != curCount) {  // 数量变 → 切曲
       curCount = cnt;
       dfB.stop();
       dfB.volume(VOL_FULL);
-      dfB.play(curCount);  // 文件 000N.mp3
-      logTrack("FG", curCount);
+      dfB.play(curCount + 1);  // 文件 000N.mp3
+      logTrack("FG", curCount + 1);
     }
 
     /* —— 漂移补偿 —— */
     if (!any && millis() - lastTouchMs > DRIFT_MS) {
-      for (uint8_t i = 0; i < N_CH; i++) {
+      for (uint8_t i = 0; i < N_CH; ++i) {
         uint16_t raw = touchRead(TOUCH_PINS[i]);
-        base[i] = (base[i] * 7 + raw) >> 3;  // EMA
+        base[i] = (base[i] * 7 + raw) >> 3;  // EMA α=1/8
       }
       lastTouchMs = millis();
       Serial.println("Baseline drift adjust");
