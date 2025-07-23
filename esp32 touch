@@ -65,10 +65,12 @@ uint8_t countTouch(bool& any) {
 
 /* ---------- SETUP ---------- */
 void setup() {
+  calibrate();
+
   Serial.begin(115200);
 
-  mp3A.begin(9600, SERIAL_8N1, 38, 39);  // RX,TX
-  mp3B.begin(9600, SERIAL_8N1, 40, 41);  // RX,TX
+  mp3A.begin(9600, SERIAL_8N1, 39, 38);  // RX,TX
+  mp3B.begin(9600, SERIAL_8N1, 41, 40);  // RX,TX
 
   if (!dfA.begin(mp3A, false, false) || !dfB.begin(mp3B, false, false)) {
     while (1) {
@@ -76,17 +78,15 @@ void setup() {
       delay(1000);
     }
   }
+
   dfA.volume(VOL_FULL);
   dfA.enableLoop();
-
+  dfA.stop();
   dfA.loop(1);  // 背景 0001.mp3
   logTrack("BG", 1);
 
   dfB.volume(VOL_MUTE);  // 默认静音
   dfB.enableLoop();
-
-  calibrate();
-  dfA.stop();
   dfB.stop();
 }
 
